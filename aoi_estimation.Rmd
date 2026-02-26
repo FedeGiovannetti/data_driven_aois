@@ -1,0 +1,200 @@
+---
+title: "Data-driven aois for peekbank"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message=F, warning=F)
+```
+
+```{r packages_and_data}
+
+# devtools::install_github("etam4260/kneedle")
+library(peekbankr)
+library(tidyverse)
+library(dbscan)
+library(ggforce)
+library(kneedle)
+library(inflection)
+source("helper/aoi_estimation.R")
+source("helper/get_data.R")
+source("helper/plot_helpers.R")
+
+```
+```{r initial_data}
+
+
+selected_data = xy_aoi_timepoints  %>% 
+  filter(!is.na(x), !is.na(y)) %>% 
+  filter(t_norm >= -500) %>% 
+  filter(t_norm <= 2500) 
+
+```
+
+
+## Cluster implementation
+
+peekbank_hdbscan() calculates the spatial clusters with parameters estimated by estimate_dbscan_params().
+
+Here, I run it subject by subject because I was interested in a more individualizaed approach. But it could be done dataset-wise for the import validation purposes (and faster calculations)
+
+clusters_into_gazes() recodes the clusters into "target", "distractor" and "other" according to the specific trial types. The decision is made by calculatin each cluster's distance to the target and the distractor fixed aoi centroids.
+
+```{r hdbscan}
+
+clustered_data = selected_data %>% 
+  group_by(administration_id) %>%
+  mutate(clusters = peekbank_hdbscan(pick(everything()))) %>% 
+  left_join(trials) 
+
+gazes = clusters_into_gazes(clustered_data) 
+
+
+```
+
+
+
+
+```{r data_selection}
+
+
+df_aois = gazes %>% 
+  left_join(trial_types) %>% 
+  
+  filter(!is.na(x), !is.na(y)) %>% 
+  group_by(administration_id, trial_id) %>%
+  mutate(n = n()) %>% 
+  filter(n >3) %>% 
+  select(-n) %>% 
+  ungroup() %>% 
+  filter(excluded == 0) %>% 
+  filter(condition == "familiar-familiar") 
+
+
+```
+
+Here we got the fixed AOIs as originally calculated.
+
+```{r old_aoi_xy_plot}
+
+
+(plot_1 <- df_aois %>% 
+  filter(excluded == 0) %>% 
+  filter(condition == "familiar-familiar") %>% 
+  ggplot() +
+  geom_point(aes(x = x, y = y, color = aoi)) +
+  # geom_rect(data = region_sets_to_df(corrected_aoi_region_sets),
+  #           aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max),
+  #           fill = NA, color = "black", linewidth = 0.8)+ 
+  scale_x_continuous(limits = c(0, x_limit)) +
+  scale_y_continuous(limits = c(0, y_limit))+
+  theme_minimal(base_size = 12)+
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+  labs(title = "xy_timepoints with fixed AOIs\nfrank_tablet_2016 familiar condition"))
+
+
+ggsave(plot_1, filename = "peekbank_xy_timepoints_fixed.png")
+
+```
+
+
+And here we got the new AOIs generated via hdbscan
+
+```{r new_aoi_xy_plot}
+
+
+(plot_2 <- df_aois %>% 
+
+  ggplot() +
+  geom_point(aes(x = x, y = y, color = new_aoi)) +
+  geom_rect(data = region_sets_to_df(aoi_region_sets),
+            aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max),
+            fill = NA, color = "black", linewidth = 0.8)+ 
+  scale_x_continuous(limits = c(0, x_limit)) +
+  scale_y_continuous(limits = c(0, y_limit))+
+
+  theme_minimal(base_size = 12)+
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+  labs(title = "xy_timepoints with data-driven AOIs (dbscan)\nfrank_tablet_2016 familiar condition"))
+
+
+ggsave(plot = plot_2, filename = "peekbank_xy_timepoints_dbscan.png")
+
+```
+
+
+In the timecourse plot, we can se that there aren't much differences between the two methods. So I'm not sure if and how this could be useful for future studies.
+
+
+```{r timecourse_plot}
+
+
+summarize_by_subj_by_AOI = df_aois %>%
+  filter(excluded == 0) %>% 
+  filter(condition == "familiar-familiar") %>% 
+  select(administration_id,, x, y, trial_id, t_norm, aoi, new_aoi) %>% 
+  pivot_longer(cols = c(aoi, new_aoi), names_to = "AOI", values_to = "position") %>% 
+  mutate(AOI = case_when(
+    AOI == "aoi" ~ "Fixed",
+    AOI == "new_aoi" ~ "Data-driven"
+  )) %>% 
+  group_by(administration_id, AOI) %>% 
+  mutate(result = case_when(
+    position == "target" ~ 1,
+    position == "distractor" ~ 0,
+    TRUE ~ NA_real_
+  )) %>%
+  group_by(administration_id, AOI, t_norm) %>%
+  summarize(
+    N = sum(!is.na(result)),
+    mean_accuracy = mean(result, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#### summarize across subjects ####
+n_administrations <- n_distinct(administrations$administration_id)
+
+summarize_across_subj_by_AOI <- summarize_by_subj_by_AOI %>%
+  group_by(AOI, t_norm) %>%
+  summarize(
+    N = sum(!is.na(mean_accuracy)),
+    accuracy = mean(mean_accuracy, na.rm = TRUE),
+    sd_accuracy = sd(mean_accuracy, na.rm = TRUE),
+    se_accuracy = sd_accuracy / sqrt(N),
+    .groups = "drop"
+  )
+
+(plot_3 <- summarize_across_subj_by_AOI %>% 
+  filter(t_norm > -500 & t_norm <= 3500) %>% 
+  
+  ggplot(aes(x = t_norm, y = accuracy, color = AOI, group = AOI)) +
+  geom_smooth(method = "gam") +
+                        geom_errorbar(aes(ymin = accuracy - se_accuracy, ymax = accuracy + se_accuracy), width = 0) +
+                        geom_point() +
+                        geom_vline(xintercept = 0) +
+                        # geom_vline(xintercept = 300, linetype = "dotted") +
+                        geom_hline(yintercept = 0.5, linetype = "dashed")+
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(title = "Comparing accuracy using fixed vs. data-driven (dbscan) AOIs\nfrank_tablet_2016 familiar condition"))
+
+ggsave(plot_3, filename = "peekbank_timecourse_aois.png")
+
+```
+
+
+Some future ideas:
+
+- Use this to check for validating something in the import pipeline (some of this already rolling).
+
+- Use this for correcting bad AOIs (e.g. use the cluster centroids to recenter the original AOIs).
+
+- Use this for older studies and check if we do see measurment errors in previous work (meaning fran_tablet_2016 may  be ok, but others may not).
+
+- Use this for developing some sort of r package for calculating AOIs for future studies (if we think this could be useful)
+
+- Use this to see if we can find specific gaze profiles in children that relate to individual differences.
